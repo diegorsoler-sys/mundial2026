@@ -323,7 +323,7 @@ function matchCard(m,live,tod){
     <div class="team-side"><span class="flag">${fl(m.homeTeam?.name)}</span><span class="team-name">${m.homeTeam?.shortName||m.homeTeam?.name||'?'}</span></div>
     <div class="score-block">
       ${(fin||live)?`<div class="score ${live?'live':''}">${hs??'?'} - ${as??'?'}</div>`:`<div class="score upcoming">${fmtTime(m.utcDate)}</div>`}
-      <div class="match-meta">${live?'<span class="sbadge s-live">'+(m.minute||'VIVO')+"'</span>":fin?'<span class="sbadge s-fin">Final</span>':'<span class="sbadge s-prox">Próximo</span>'}${m.group?' · '+m.group.replace('GROUP_','G.'):''}
+      <div class="match-meta">${live?`<span class="sbadge s-live">${m.minute?m.minute+"'":''} ${m.status==='PAUSED'?'| ET':''} EN VIVO</span>`:fin?'<span class="sbadge s-fin">Final</span>':'<span class="sbadge s-prox">Próximo</span>'}${m.group?' · '+m.group.replace('GROUP_','G.'):''}
       </div>
     </div>
     <div class="team-side right"><span class="flag">${fl(m.awayTeam?.name)}</span><span class="team-name">${m.awayTeam?.shortName||m.awayTeam?.name||'?'}</span></div>
@@ -551,8 +551,14 @@ async function renderBracket(){
 }
 
 function _drawBracketFromCache(){
-  if(!cachedStandings||!cachedStandings.length) return;
+  if(!cachedStandings||!cachedStandings.length){
+    console.log('[Bracket] No cachedStandings yet');
+    return;
+  }
+  console.log('[Bracket] Drawing from cache, groups:', cachedStandings.map(g=>g.group));
   const parsed = parseStandingsIntoTables(cachedStandings);
+  console.log('[Bracket] Tables keys:', Object.keys(parsed.tables));
+  console.log('[Bracket] Sample group A:', parsed.tables['A']?.map(t=>t.name+' '+t.pts+'pts'));
   _drawBracket(parsed.tables, parsed.confirmed);
   document.getElementById('bracket-mode').textContent='📡 Tabla en tiempo real';
 }
@@ -612,10 +618,33 @@ function calcAllTablesForBracket(){
   return r;
 }
 
+// TLA (3-letter code) to flag map for API teams
+const TLA_FLAGS={'MEX':'🇲🇽','KOR':'🇰🇷','RSA':'🇿🇦','CZE':'🇨🇿','CAN':'🇨🇦','SUI':'🇨🇭',
+'QAT':'🇶🇦','BIH':'🇧🇦','BRA':'🇧🇷','MAR':'🇲🇦','SCO':'🏴󠁧󠁢󠁳󠁣󠁴󠁿','HAI':'🇭🇹',
+'USA':'🇺🇸','AUS':'🇦🇺','PAR':'🇵🇾','TUR':'🇹🇷','GER':'🇩🇪','ECU':'🇪🇨',
+'CIV':'🇨🇮','CUW':'🇨🇼','NED':'🇳🇱','JPN':'🇯🇵','TUN':'🇹🇳','SWE':'🇸🇪',
+'BEL':'🇧🇪','IRN':'🇮🇷','EGY':'🇪🇬','NZL':'🇳🇿','ESP':'🇪🇸','URU':'🇺🇾',
+'SAU':'🇸🇦','CPV':'🇨🇻','FRA':'🇫🇷','SEN':'🇸🇳','NOR':'🇳🇴','IRQ':'🇮🇶',
+'ARG':'🇦🇷','AUT':'🇦🇹','ALG':'🇩🇿','JOR':'🇯🇴','POR':'🇵🇹','COL':'🇨🇴',
+'UZB':'🇺🇿','COD':'🇨🇩','ENG':'🏴󠁧󠁢󠁥󠁮󠁧󠁿','CRO':'🇭🇷','PAN':'🇵🇦','GHA':'🇬🇭'};
+
+function flTeam(t){
+  if(!t) return '🏳️';
+  if(t.tla && TLA_FLAGS[t.tla]) return TLA_FLAGS[t.tla];
+  return fl(t.name||t.shortName||'');
+}
+
+function displayName(t){
+  if(!t) return '';
+  // Use shortName from API if available (already localized)
+  const n = t.shortName||t.name||'';
+  return sn(n)||n;
+}
+
 function bmatch(h,a,hl,al){
   function teamRow(t,label){
     if(!t) return `<div class="bt pending"><span class="tbd">${label}</span></div>`;
-    const name = `${fl(t.name||t.shortName)} ${sn(t.name||t.shortName)}`;
+    const name = `${flTeam(t)} ${displayName(t)}`;
     if(t.confirmed){
       return `<div class="bt confirmed">${name}<span class="conf-badge">✓</span></div>`;
     }

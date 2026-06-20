@@ -255,9 +255,19 @@ function goNav(id,btn){
   if(id==='bracket')renderBracket();
 }
 
+const FD_KEY = '569d8cd315284b8b948e60ee17bef8a3';
+
 async function apiFetch(path){
-  const res=await fetch('/api/matches?path='+encodeURIComponent(path));
-  if(!res.ok)throw new Error('HTTP '+res.status);
+  // Intentar proxy primero, si falla ir directo a football-data.org
+  try{
+    const res = await fetch('/api/matches?path='+encodeURIComponent(path));
+    if(res.ok) return res.json();
+  } catch(e){}
+  // Fallback directo con CORS headers de football-data.org
+  const res = await fetch('https://api.football-data.org/v4/'+path, {
+    headers:{ 'X-Auth-Token': FD_KEY }
+  });
+  if(!res.ok) throw new Error('HTTP '+res.status);
   return res.json();
 }
 
@@ -493,6 +503,16 @@ let apiTables = {}; // {A: [{name,pts,pj,gf,ga,confirmed}, ...], ...}
 
 async function renderBracket(){
   const el=document.getElementById('bracket-content');
+  // Si ya hay cache, mostrar inmediatamente y refrescar en background
+  if(cachedStandings && cachedStandings.length){
+    _drawBracketFromCache();
+    // Refrescar en background sin spinner
+    apiFetch('competitions/WC/standings').then(d=>{
+      const st=(d.standings||[]).filter(s=>s.type==='TOTAL'&&s.group);
+      if(st.length){ cachedStandings=st; lastStandingsContext=buildStandingsContext(st); _drawBracketFromCache(); }
+    }).catch(()=>{});
+    return;
+  }
   el.innerHTML='<div class="spinner">Cargando tabla en tiempo real...</div>';
   // Siempre intentar cargar datos reales de la API primero
   let tables = {};
@@ -527,6 +547,18 @@ async function renderBracket(){
     document.getElementById('bracket-mode').textContent = simMode==='manual'?'✏️ Tu simulación':'📋 Sin conexión';
   }
 
+  _drawBracket(tables, confirmed);
+}
+
+function _drawBracketFromCache(){
+  if(!cachedStandings||!cachedStandings.length) return;
+  const parsed = parseStandingsIntoTables(cachedStandings);
+  _drawBracket(parsed.tables, parsed.confirmed);
+  document.getElementById('bracket-mode').textContent='📡 Tabla en tiempo real';
+}
+
+function _drawBracket(tables, confirmed){
+  const el=document.getElementById('bracket-content');
   // Calcular terceros
   const thirds = Object.entries(tables).map(([g,t])=>t[2]?{...t[2],group:g}:null)
     .filter(Boolean)
@@ -534,23 +566,20 @@ async function renderBracket(){
   const top8=thirds.slice(0,8);
   const used=new Set();
 
-  function isConfirmed(team, g){
-    if(!team||!team.name) return false;
-    return confirmed[g]&&confirmed[g][team.name];
-  }
+  function isConf(team,g){ return !!(team&&team.name&&confirmed[g]&&confirmed[g][team.name]); }
 
   function resolveT(slot){
     if(slot[0]==='1'||slot[0]==='2'){
       const g=slot[1]; const t=tables[g]; if(!t) return null;
-      const team = t[slot[0]==='1'?0:1]||null;
-      return team ? {...team, confirmed: isConfirmed(team,g), group:g} : null;
+      const team=t[slot[0]==='1'?0:1]||null;
+      return team?{...team,confirmed:isConf(team,g),group:g}:null;
     }
     if(slot[0]==='3'){
       const eligible=slot.slice(1).split('');
       for(const th of top8){
         if(eligible.includes(th.group)&&!used.has(th.name)){
           used.add(th.name);
-          return {...th, confirmed: isConfirmed(th,th.group)};
+          return {...th,confirmed:isConf(th,th.group)};
         }
       }
       return null;
@@ -559,7 +588,6 @@ async function renderBracket(){
   }
 
   const r32=R32.map(m=>({home:resolveT(m.h),away:resolveT(m.a),hl:m.h,al:m.a}));
-
   el.innerHTML=`<div class="bracket-wrap"><div class="bracket">
     <div class="round-col"><div class="round-title">Ronda 32</div><div class="round-matches">${r32.map(m=>bmatch(m.home,m.away,m.hl,m.al)).join('')}</div></div>
     <div class="round-col"><div class="round-title">Octavos</div><div class="round-matches">${Array(8).fill(tbdm()).join('')}</div></div>
@@ -568,11 +596,11 @@ async function renderBracket(){
     <div class="round-col"><div class="round-title">🏆 Final</div><div class="round-matches">${tbdm()}</div></div>
   </div></div>
   <div style="margin-top:.75rem;display:flex;gap:1rem;flex-wrap:wrap;font-size:.68rem;">
-    <span style="color:var(--green);">● Clasificado confirmado (3PJ)</span>
-    <span style="color:var(--accent);">◉ Proyectado (en curso)</span>
+    <span style="color:var(--green);">● Confirmado (3PJ)</span>
+    <span style="color:var(--accent);">◉ Proyectado</span>
     <span style="color:var(--muted);">○ Por definir</span>
   </div>
-  <p style="margin-top:.5rem;font-size:.7rem;color:var(--muted);">💡 Emparejamientos oficiales FIFA (M73–M88). La tabla se actualiza en tiempo real.</p>`;
+  <p style="margin-top:.5rem;font-size:.7rem;color:var(--muted);">💡 Emparejamientos oficiales FIFA (M73–M88).</p>`;
 }
 
 function calcAllTablesForBracket(){
@@ -673,7 +701,14 @@ async function loadStandingsSilent(){
   try{
     const d=await apiFetch('competitions/WC/standings');
     const st=(d.standings||[]).filter(s=>s.type==='TOTAL'&&s.group);
-    if(st.length){ cachedStandings=st; lastStandingsContext=buildStandingsContext(st); }
+    if(st.length){
+      cachedStandings=st;
+      lastStandingsContext=buildStandingsContext(st);
+      // Si el usuario está viendo las llaves, actualizarlas automáticamente
+      if(document.getElementById('bracket').classList.contains('active')){
+        _drawBracketFromCache();
+      }
+    }
   }catch(e){}
 }
 </script>

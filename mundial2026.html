@@ -92,6 +92,11 @@ tr.q3{background:rgba(255,215,64,.04);}
 .bt:last-child{border-bottom:none;}
 .bt.winner{background:rgba(0,180,255,.08);font-weight:700;color:var(--accent2);}
 .tbd{color:var(--muted);font-style:italic;font-size:.68rem;}
+.bt.confirmed{background:rgba(0,230,118,.1);border-left:3px solid var(--green);font-weight:700;color:#e8fff4;}
+.bt.projected{background:rgba(0,180,255,.07);border-left:3px solid var(--accent);color:var(--text2);}
+.bt.pending{opacity:.45;}
+.conf-badge{font-size:.6rem;color:var(--green);margin-left:auto;padding-left:.4rem;font-weight:900;}
+.proj-badge{font-size:.6rem;color:var(--accent);margin-left:auto;padding-left:.4rem;opacity:.7;}
 .spinner{text-align:center;padding:2.5rem;color:var(--muted);font-size:.82rem;}
 .spinner::before{content:'';display:block;width:32px;height:32px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto .75rem;}
 @keyframes spin{to{transform:rotate(360deg);}}
@@ -463,32 +468,115 @@ async function simFromAPI(){
   }catch(e){document.getElementById('sim-mode-badge').textContent='⚠️ '+e.message;}
 }
 
-function renderBracket(){
-  const tables=calcAllTables();
-  const thirds=Object.entries(tables).map(([g,t])=>({...t[2],group:g})).filter(t=>t&&t.name)
+// Tabla real de la API — se llena cuando se carga standings
+let apiTables = {}; // {A: [{name,pts,pj,gf,ga,confirmed}, ...], ...}
+
+async function renderBracket(){
+  const el=document.getElementById('bracket-content');
+  el.innerHTML='<div class="spinner">Cargando tabla en tiempo real...</div>';
+  // Siempre intentar cargar datos reales de la API primero
+  let tables = {};
+  let confirmed = {}; // {G: {teamName: true/false}} — si ya jugó los 3 partidos
+  try{
+    const d = await apiFetch('competitions/WC/standings');
+    const st = (d.standings||[]).filter(s=>s.type==='TOTAL'&&s.group);
+    if(st.length){
+      st.forEach(g=>{
+        const gKey = g.group.replace('GROUP_','');
+        tables[gKey] = g.table.map(t=>({
+          name: t.team?.name||'',
+          shortName: t.team?.shortName||t.team?.name||'',
+          pts: t.points,
+          pj: t.playedGames,
+          gf: t.goalsFor,
+          ga: t.goalsAgainst,
+          tla: t.team?.tla||''
+        }));
+        // Confirmado = jugó los 3 partidos del grupo
+        confirmed[gKey]={};
+        tables[gKey].forEach(t=>{ confirmed[gKey][t.name] = t.pj>=3; });
+      });
+      lastStandingsContext = buildStandingsContext(st);
+      simMode='api';
+      document.getElementById('bracket-mode').textContent='📡 Tabla en tiempo real';
+    } else { throw new Error('sin datos'); }
+  } catch(e){
+    // Fallback: usar simulador local
+    tables = calcAllTablesForBracket();
+    confirmed = {};
+    Object.keys(tables).forEach(g=>{ confirmed[g]={}; tables[g].forEach(t=>{ confirmed[g][t.name]=t.pj>=3; }); });
+    document.getElementById('bracket-mode').textContent = simMode==='manual'?'✏️ Tu simulación':'📋 Sin conexión — tabla estimada';
+  }
+
+  // Calcular terceros
+  const thirds = Object.entries(tables).map(([g,t])=>t[2]?{...t[2],group:g}:null)
+    .filter(Boolean)
     .sort((a,b)=>{if(b.pts!==a.pts)return b.pts-a.pts;const d=(b.gf-b.ga)-(a.gf-a.ga);if(d!==0)return d;return b.gf-a.gf;});
-  const top8=thirds.slice(0,8);const used=new Set();
+  const top8=thirds.slice(0,8);
+  const used=new Set();
+
+  function isConfirmed(team, g){
+    if(!team||!team.name) return false;
+    return confirmed[g]&&confirmed[g][team.name];
+  }
+
   function resolveT(slot){
-    if(slot[0]==='1'||slot[0]==='2'){const t=tables[slot[1]];if(!t)return null;return t[slot[0]==='1'?0:1]||null;}
-    if(slot[0]==='3'){const el=slot.slice(1).split('');for(const th of top8){if(el.includes(th.group)&&!used.has(th.name)){used.add(th.name);return th;}}return null;}
+    if(slot[0]==='1'||slot[0]==='2'){
+      const g=slot[1]; const t=tables[g]; if(!t) return null;
+      const team = t[slot[0]==='1'?0:1]||null;
+      return team ? {...team, confirmed: isConfirmed(team,g), group:g} : null;
+    }
+    if(slot[0]==='3'){
+      const eligible=slot.slice(1).split('');
+      for(const th of top8){
+        if(eligible.includes(th.group)&&!used.has(th.name)){
+          used.add(th.name);
+          return {...th, confirmed: isConfirmed(th,th.group)};
+        }
+      }
+      return null;
+    }
     return null;
   }
+
   const r32=R32.map(m=>({home:resolveT(m.h),away:resolveT(m.a),hl:m.h,al:m.a}));
-  document.getElementById('bracket-mode').textContent=simMode==='api'?'📡 Datos reales':simMode==='manual'?'✏️ Tu simulación':'📋 Inicio torneo';
-  document.getElementById('bracket-content').innerHTML=`<div class="bracket-wrap"><div class="bracket">
+
+  el.innerHTML=`<div class="bracket-wrap"><div class="bracket">
     <div class="round-col"><div class="round-title">Ronda 32</div><div class="round-matches">${r32.map(m=>bmatch(m.home,m.away,m.hl,m.al)).join('')}</div></div>
     <div class="round-col"><div class="round-title">Octavos</div><div class="round-matches">${Array(8).fill(tbdm()).join('')}</div></div>
     <div class="round-col"><div class="round-title">Cuartos</div><div class="round-matches">${Array(4).fill(tbdm()).join('')}</div></div>
     <div class="round-col"><div class="round-title">Semis</div><div class="round-matches">${Array(2).fill(tbdm()).join('')}</div></div>
     <div class="round-col"><div class="round-title">🏆 Final</div><div class="round-matches">${tbdm()}</div></div>
   </div></div>
-  <p style="margin-top:.75rem;font-size:.7rem;color:var(--muted);">💡 Emparejamientos oficiales FIFA (M73–M88). Usa el Simulador para pronosticar siguientes rondas.</p>`;
+  <div style="margin-top:.75rem;display:flex;gap:1rem;flex-wrap:wrap;font-size:.68rem;">
+    <span style="color:var(--green);">● Clasificado confirmado (3PJ)</span>
+    <span style="color:var(--accent);">◉ Proyectado (en curso)</span>
+    <span style="color:var(--muted);">○ Por definir</span>
+  </div>
+  <p style="margin-top:.5rem;font-size:.7rem;color:var(--muted);">💡 Emparejamientos oficiales FIFA (M73–M88). La tabla se actualiza en tiempo real.</p>`;
+}
+
+function calcAllTablesForBracket(){
+  const r={};
+  Object.keys(GROUPS).forEach(g=>{
+    const t=calcTable(g);
+    r[g]=t.map(tm=>({...tm,shortName:sn(tm.name),tla:''}));
+  });
+  return r;
 }
 
 function bmatch(h,a,hl,al){
-  return `<div class="bm"><div class="bt">${h?`${fl(h.name)} ${sn(h.name)}`:`<span class="tbd">${hl}</span>`}</div><div class="bt">${a?`${fl(a.name)} ${sn(a.name)}`:`<span class="tbd">${al}</span>`}</div></div>`;
+  function teamRow(t,label){
+    if(!t) return `<div class="bt pending"><span class="tbd">${label}</span></div>`;
+    const name = `${fl(t.name||t.shortName)} ${sn(t.name||t.shortName)}`;
+    if(t.confirmed){
+      return `<div class="bt confirmed">${name}<span class="conf-badge">✓</span></div>`;
+    }
+    return `<div class="bt projected">${name}<span class="proj-badge">~</span></div>`;
+  }
+  return `<div class="bm">${teamRow(h,hl)}${teamRow(a,al)}</div>`;
 }
-function tbdm(){return `<div class="bm"><div class="bt"><span class="tbd">Por definir</span></div><div class="bt"><span class="tbd">Por definir</span></div></div>`;}
+function tbdm(){return `<div class="bm"><div class="bt pending"><span class="tbd">Por definir</span></div><div class="bt pending"><span class="tbd">Por definir</span></div></div>`;}
 
 // ══════════════════════════════════
 // CHAT IA

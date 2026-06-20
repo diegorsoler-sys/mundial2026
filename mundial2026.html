@@ -331,6 +331,25 @@ function mockMatchHTML(){
   </div>`;
 }
 
+// Cache global de standings de la API
+let cachedStandings = null;
+
+function parseStandingsIntoTables(st){
+  const tables={}, confirmed={};
+  st.forEach(g=>{
+    const gKey=g.group.replace('GROUP_','');
+    tables[gKey]=g.table.map(t=>({
+      name:t.team?.name||'',
+      shortName:t.team?.shortName||t.team?.name||'',
+      pts:t.points, pj:t.playedGames,
+      gf:t.goalsFor, ga:t.goalsAgainst, tla:t.team?.tla||''
+    }));
+    confirmed[gKey]={};
+    tables[gKey].forEach(t=>{confirmed[gKey][t.name]=t.pj>=3;});
+  });
+  return {tables, confirmed};
+}
+
 async function loadStandings(){
   const el=document.getElementById('grupos-content');
   el.innerHTML='<div class="spinner">Cargando...</div>';
@@ -338,6 +357,7 @@ async function loadStandings(){
     const d=await apiFetch('competitions/WC/standings');
     const st=(d.standings||[]).filter(s=>s.type==='TOTAL'&&s.group);
     if(!st.length)throw new Error('Sin datos');
+    cachedStandings=st;
     lastStandingsContext=buildStandingsContext(st);
     el.innerHTML=`<div class="grupos-grid">${st.map(g=>{
       const name=g.group.replace('GROUP_','Grupo ');
@@ -477,35 +497,34 @@ async function renderBracket(){
   // Siempre intentar cargar datos reales de la API primero
   let tables = {};
   let confirmed = {}; // {G: {teamName: true/false}} — si ya jugó los 3 partidos
-  try{
-    const d = await apiFetch('competitions/WC/standings');
-    const st = (d.standings||[]).filter(s=>s.type==='TOTAL'&&s.group);
-    if(st.length){
-      st.forEach(g=>{
-        const gKey = g.group.replace('GROUP_','');
-        tables[gKey] = g.table.map(t=>({
-          name: t.team?.name||'',
-          shortName: t.team?.shortName||t.team?.name||'',
-          pts: t.points,
-          pj: t.playedGames,
-          gf: t.goalsFor,
-          ga: t.goalsAgainst,
-          tla: t.team?.tla||''
-        }));
-        // Confirmado = jugó los 3 partidos del grupo
-        confirmed[gKey]={};
-        tables[gKey].forEach(t=>{ confirmed[gKey][t.name] = t.pj>=3; });
-      });
-      lastStandingsContext = buildStandingsContext(st);
-      simMode='api';
-      document.getElementById('bracket-mode').textContent='📡 Tabla en tiempo real';
-    } else { throw new Error('sin datos'); }
-  } catch(e){
-    // Fallback: usar simulador local
+  // 1. Usar cache si ya cargamos standings, si no intentar API
+  let loaded = false;
+  if(cachedStandings && cachedStandings.length){
+    const parsed = parseStandingsIntoTables(cachedStandings);
+    tables = parsed.tables; confirmed = parsed.confirmed;
+    document.getElementById('bracket-mode').textContent='📡 Tabla en tiempo real';
+    loaded = true;
+  }
+  if(!loaded){
+    try{
+      const d = await apiFetch('competitions/WC/standings');
+      const st = (d.standings||[]).filter(s=>s.type==='TOTAL'&&s.group);
+      if(st.length){
+        cachedStandings = st;
+        lastStandingsContext = buildStandingsContext(st);
+        const parsed = parseStandingsIntoTables(st);
+        tables = parsed.tables; confirmed = parsed.confirmed;
+        document.getElementById('bracket-mode').textContent='📡 Tabla en tiempo real';
+        loaded = true;
+      }
+    } catch(e){}
+  }
+  if(!loaded){
+    // Fallback: simulador local
     tables = calcAllTablesForBracket();
     confirmed = {};
     Object.keys(tables).forEach(g=>{ confirmed[g]={}; tables[g].forEach(t=>{ confirmed[g][t.name]=t.pj>=3; }); });
-    document.getElementById('bracket-mode').textContent = simMode==='manual'?'✏️ Tu simulación':'📋 Sin conexión — tabla estimada';
+    document.getElementById('bracket-mode').textContent = simMode==='manual'?'✏️ Tu simulación':'📋 Sin conexión';
   }
 
   // Calcular terceros
@@ -645,7 +664,18 @@ async function sendChat(){
 }
 
 loadMatches();
+// Pre-cargar standings al inicio para que las llaves tengan datos inmediatamente
+loadStandingsSilent();
 setInterval(()=>{if(document.getElementById('partidos').classList.contains('active'))loadMatches();},60000);
+setInterval(()=>{ loadStandingsSilent(); },120000); // refrescar tabla cada 2 min
+
+async function loadStandingsSilent(){
+  try{
+    const d=await apiFetch('competitions/WC/standings');
+    const st=(d.standings||[]).filter(s=>s.type==='TOTAL'&&s.group);
+    if(st.length){ cachedStandings=st; lastStandingsContext=buildStandingsContext(st); }
+  }catch(e){}
+}
 </script>
 </body>
 </html>

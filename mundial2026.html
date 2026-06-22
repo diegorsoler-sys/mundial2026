@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Mundial 2026 v3.5 — By Diego Soler</title>
+<title>Mundial 2026 v3.5.1 — By Diego Soler</title>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -198,7 +198,7 @@ tr.q3{background:rgba(255,215,64,.04);}
   <div class="header-inner">
     <div>
       <div class="logo">MUNDIAL <span>2026</span></div>
-      <div class="byline">By Diego Soler · v3.5 · LIVE BRACKET</div>
+      <div class="byline">By Diego Soler · v3.5.2.1 · CACHE LIVE</div>
     </div>
     <nav>
       <button class="active" onclick="goNav('partidos',this)"><span class="live-dot"></span>En Vivo</button>
@@ -212,14 +212,14 @@ tr.q3{background:rgba(255,215,64,.04);}
 
 <!-- PARTIDOS -->
 <div id="partidos" class="section active">
-  <div class="row-top"><h2>Partidos</h2><button class="btn sec" onclick="loadMatches()">↻ Actualizar</button></div>
+  <div class="row-top"><h2>Partidos</h2><button class="btn sec" onclick="loadMatches(true)">↻ Actualizar</button></div>
   <div id="partidos-content"><div class="spinner">Cargando...</div></div>
   <div class="upd" id="last-update"></div>
 </div>
 
 <!-- GRUPOS -->
 <div id="grupos" class="section">
-  <div class="row-top"><h2>Grupos</h2><button class="btn sec" onclick="loadStandings()">↻ Actualizar</button></div>
+  <div class="row-top"><h2>Grupos</h2><button class="btn sec" onclick="loadStandings(true)">↻ Actualizar</button></div>
   <div class="legend">
     <div class="li"><div class="ld" style="background:var(--green)"></div>Clasifica (1°-2°)</div>
     <div class="li"><div class="ld" style="background:var(--yellow)"></div>Posible mejor 3°</div>
@@ -246,7 +246,7 @@ tr.q3{background:rgba(255,215,64,.04);}
 
 <!-- BRACKET -->
 <div id="bracket" class="section">
-  <div class="row-top"><h2>Llaves</h2><button class="btn sec" onclick="drawBracket()">↻ Actualizar</button></div>
+  <div class="row-top"><h2>Llaves</h2><button class="btn sec" onclick="drawBracket(true)">↻ Actualizar</button></div>
   <div id="bracket-content"><div class="spinner">Cargando...</div></div>
 </div>
 
@@ -265,6 +265,7 @@ tr.q3{background:rgba(255,215,64,.04);}
     <div class="chat-suggs" id="chat-suggs">
       <div class="sugg" onclick="sendSugg(this)">¿Cómo se calculan las llaves?</div>
       <div class="sugg" onclick="sendSugg(this)">¿Qué es el mejor 3°?</div>
+      <div class="sugg" onclick="sendSugg(this)">¿Cuándo juega Colombia?</div>
       <div class="sugg" onclick="sendSugg(this)">¿Cuándo es la final?</div>
     </div>
     <div class="chat-msgs" id="chat-msgs">
@@ -348,12 +349,199 @@ function goNav(id,btn){
   if(id==='bracket') drawBracket();
 }
 
-// ════════ API ════════
+// ════════ API + CACHE INTELIGENTE ════════
+// La API puede responder 429 cuando recibe varias consultas simultáneas. Este
+// cliente persiste fixtures y resultados finalizados en localStorage; después
+// de la primera carga, el polling consulta solamente IN_PLAY/PAUSED. Los
+// partidos finalizados se reconcilian en segundo plano de forma poco frecuente
+// y una vez adicional al desaparecer un partido que estaba en vivo.
 const FD_KEY='569d8cd315284b8b948e60ee17bef8a3';
-async function apiFetch(path){
-  const r=await fetch('/api/matches?path='+encodeURIComponent(path));
-  if(!r.ok) throw new Error('HTTP '+r.status);
-  return r.json();
+const MATCH_CACHE_KEY='wc26-match-cache-v3.5.1';
+const STANDINGS_CACHE_KEY='wc26-official-standings-v3.5.1';
+const LIVE_POLL_MS=30000;
+const MANUAL_LIVE_MIN_MS=8000;
+const FINISHED_RECONCILE_MS=6*60*60*1000;
+const STANDINGS_CACHE_TTL=10*60*1000;
+
+let apiRateLimitUntil=0;
+let lastApiWarning='';
+let matchCache=null, matchCachePromise=null, liveRefreshPromise=null, finishedRefreshPromise=null;
+let lastLivePollAt=0;
+let officialStandingsSnapshot=null, standingsPromise=null;
+
+function wait(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
+function retryDelayMs(response,attempt){
+  const retryAfter=Number(response?.headers?.get?.('Retry-After'));
+  if(Number.isFinite(retryAfter)&&retryAfter>0) return Math.min(retryAfter*1000,60000);
+  return Math.min(5000*Math.pow(2,attempt),60000);
+}
+function rateLimitMessage(){
+  const seconds=Math.max(1,Math.ceil((apiRateLimitUntil-Date.now())/1000));
+  return `La API está limitando solicitudes (HTTP 429). Se mantienen los datos guardados y se reintentará en ${seconds}s.`;
+}
+async function apiFetch(path,{retries=1}={}){
+  if(Date.now()<apiRateLimitUntil){
+    const err=new Error(rateLimitMessage()); err.status=429; throw err;
+  }
+  for(let attempt=0;attempt<=retries;attempt++){
+    const r=await fetch('/api/matches?path='+encodeURIComponent(path));
+    if(r.status===429){
+      const delay=retryDelayMs(r,attempt);
+      apiRateLimitUntil=Date.now()+delay;
+      lastApiWarning=`HTTP 429: usando datos guardados; próximo intento en ${Math.ceil(delay/1000)}s.`;
+      if(attempt<retries){await wait(delay);continue;}
+      const err=new Error(rateLimitMessage()); err.status=429; throw err;
+    }
+    if(!r.ok){
+      const err=new Error('HTTP '+r.status); err.status=r.status; throw err;
+    }
+    lastApiWarning='';
+    return r.json();
+  }
+}
+function emptyMatchCache(){return {version:1,matches:{},lastFullSync:0,lastLiveSync:0,lastFinishedSync:0};}
+function matchCacheKey(m){
+  return String(m?.id??`${m?.utcDate||''}|${m?.homeTeam?.tla||m?.homeTeam?.name||''}|${m?.awayTeam?.tla||m?.awayTeam?.name||''}`);
+}
+function getMatchCache(){
+  if(matchCache) return matchCache;
+  try{
+    const saved=JSON.parse(localStorage.getItem(MATCH_CACHE_KEY)||'null');
+    if(saved&&saved.matches&&typeof saved.matches==='object'){
+      matchCache={...emptyMatchCache(),...saved,matches:saved.matches};
+      return matchCache;
+    }
+  }catch(_){}
+  matchCache=emptyMatchCache();
+  return matchCache;
+}
+function saveMatchCache(){
+  try{localStorage.setItem(MATCH_CACHE_KEY,JSON.stringify(getMatchCache()));}catch(_){}
+}
+function cachedMatches(){
+  return Object.values(getMatchCache().matches||{}).sort((a,b)=>new Date(a.utcDate)-new Date(b.utcDate));
+}
+function mergeMatches(matches){
+  const cache=getMatchCache();
+  (matches||[]).forEach(match=>{
+    const key=matchCacheKey(match); if(!key) return;
+    const previous=cache.matches[key];
+    // Un marcador final jamás se degrada a un estado anterior por una respuesta tardía.
+    if(previous?.status==='FINISHED'&&match?.status!=='FINISHED') return;
+    cache.matches[key]={...previous,...match};
+  });
+  saveMatchCache();
+}
+function cachedLiveMatches(){
+  return cachedMatches().filter(m=>m.status==='IN_PLAY'||m.status==='PAUSED'||m.status==='SUSPENDED');
+}
+function cacheStatusText(){
+  const cache=getMatchCache();
+  const last=Math.max(cache.lastLiveSync||0,cache.lastFullSync||0,cache.lastFinishedSync||0);
+  const base=last?`Datos locales: ${new Date(last).toLocaleTimeString('es-MX')}`:'Datos locales disponibles';
+  return lastApiWarning?`${base} · ${lastApiWarning}`:base;
+}
+async function ensureMatchCache(){
+  const cache=getMatchCache();
+  if(Object.keys(cache.matches).length) return cache;
+  if(matchCachePromise) return matchCachePromise;
+  matchCachePromise=(async()=>{
+    const data=await apiFetch('competitions/WC/matches',{retries:1});
+    mergeMatches(data.matches||[]);
+    const target=getMatchCache();
+    target.lastFullSync=Date.now();
+    target.lastFinishedSync=target.lastFullSync;
+    target.lastLiveSync=target.lastFullSync;
+    saveMatchCache();
+    return target;
+  })().finally(()=>{matchCachePromise=null;});
+  return matchCachePromise;
+}
+async function refreshFinishedMatches(force=false){
+  await ensureMatchCache();
+  const cache=getMatchCache();
+  if(!force&&Date.now()-(cache.lastFinishedSync||0)<FINISHED_RECONCILE_MS) return cachedMatches();
+  if(finishedRefreshPromise) return finishedRefreshPromise;
+  finishedRefreshPromise=(async()=>{
+    try{
+      const data=await apiFetch('competitions/WC/matches?status=FINISHED',{retries:0});
+      mergeMatches(data.matches||[]);
+      getMatchCache().lastFinishedSync=Date.now();
+      saveMatchCache();
+    }catch(error){
+      lastApiWarning=error.status===429?rateLimitMessage():'No se pudieron reconciliar finales; se usa la caché local.';
+      if(!cachedMatches().length) throw error;
+    }
+    return cachedMatches();
+  })().finally(()=>{finishedRefreshPromise=null;});
+  return finishedRefreshPromise;
+}
+async function refreshLiveMatches(force=false){
+  await ensureMatchCache();
+  const elapsed=Date.now()-lastLivePollAt;
+  const minInterval=force?MANUAL_LIVE_MIN_MS:LIVE_POLL_MS;
+  if(elapsed<minInterval) return cachedMatches();
+  if(liveRefreshPromise) return liveRefreshPromise;
+  liveRefreshPromise=(async()=>{
+    const wasLive=cachedLiveMatches();
+    lastLivePollAt=Date.now();
+    try{
+      // Una sola petición normalmente basta. PAUSED se consulta solo si no hay IN_PLAY.
+      let data=await apiFetch('competitions/WC/matches?status=IN_PLAY',{retries:1});
+      let active=data.matches||[];
+      if(!active.length){
+        data=await apiFetch('competitions/WC/matches?status=PAUSED',{retries:0});
+        active=data.matches||[];
+      }
+      mergeMatches(active);
+      getMatchCache().lastLiveSync=Date.now();
+      saveMatchCache();
+      // Si un partido que estaba activo dejó de aparecer, se actualizan los finales una sola vez.
+      if(wasLive.length&&!active.length) await refreshFinishedMatches(true);
+    }catch(error){
+      lastApiWarning=error.status===429?rateLimitMessage():'No se pudo actualizar En Vivo; se muestran datos guardados.';
+      if(!cachedMatches().length) throw error;
+    }
+    return cachedMatches();
+  })().finally(()=>{liveRefreshPromise=null;});
+  return liveRefreshPromise;
+}
+async function getTournamentMatches({forceLive=false,refreshFinished=false}={}){
+  await ensureMatchCache();
+  await refreshLiveMatches(forceLive);
+  const cache=getMatchCache();
+  if(refreshFinished||Date.now()-(cache.lastFinishedSync||0)>=FINISHED_RECONCILE_MS){
+    await refreshFinishedMatches(Boolean(refreshFinished));
+  }
+  return cachedMatches();
+}
+function readCachedStandings(){
+  if(officialStandingsSnapshot) return officialStandingsSnapshot;
+  try{
+    const saved=JSON.parse(localStorage.getItem(STANDINGS_CACHE_KEY)||'null');
+    if(saved&&Array.isArray(saved.standings)) officialStandingsSnapshot=saved;
+  }catch(_){}
+  return officialStandingsSnapshot;
+}
+async function getOfficialStandings(){
+  const cached=readCachedStandings();
+  if(cached&&Date.now()-(cached.updatedAt||0)<STANDINGS_CACHE_TTL) return cached.standings;
+  if(standingsPromise) return standingsPromise;
+  standingsPromise=(async()=>{
+    try{
+      const data=await apiFetch('competitions/WC/standings',{retries:0});
+      const standings=(data.standings||[]).filter(s=>s?.type==='TOTAL'&&s?.group);
+      if(standings.length){
+        officialStandingsSnapshot={updatedAt:Date.now(),standings};
+        cachedStandings=standings;
+        try{localStorage.setItem(STANDINGS_CACHE_KEY,JSON.stringify(officialStandingsSnapshot));}catch(_){}
+      }
+    }catch(error){
+      lastApiWarning=error.status===429?rateLimitMessage():'No se pudo refrescar el desempate oficial; se conserva la última tabla FIFA guardada.';
+    }
+    return officialStandingsSnapshot?.standings||cachedStandings||[];
+  })().finally(()=>{standingsPromise=null;});
+  return standingsPromise;
 }
 
 function matchScore(m){
@@ -369,15 +557,20 @@ function fmtTime(u){return new Date(u).toLocaleTimeString('es-MX',{hour:'2-digit
 function isToday(u){const d=new Date(u),n=new Date();return d.getFullYear()===n.getFullYear()&&d.getMonth()===n.getMonth()&&d.getDate()===n.getDate();}
 function isFuture(u){return new Date(u)>new Date();}
 
-async function loadMatches(){
+async function loadMatches(force=false){
   const el=document.getElementById('partidos-content');
-  el.innerHTML='<div class="spinner">Cargando...</div>';
+  const saved=cachedMatches();
+  if(saved.length) renderMatches(saved);
+  else el.innerHTML='<div class="spinner">Cargando calendario inicial...</div>';
   try{
-    const d=await apiFetch('competitions/WC/matches');
-    renderMatches(d.matches||[]);
-    document.getElementById('last-update').textContent='Actualizado: '+new Date().toLocaleTimeString('es-MX');
+    const matches=await getTournamentMatches({forceLive:force});
+    renderMatches(matches);
+    document.getElementById('last-update').textContent='Actualizado: '+new Date().toLocaleTimeString('es-MX')+' · '+cacheStatusText();
   }catch(e){
-    el.innerHTML='<div class="err">⚠️ '+e.message+'</div>';
+    if(saved.length){
+      renderMatches(saved);
+      document.getElementById('last-update').textContent='Mostrando caché local · '+(e.message||cacheStatusText());
+    }else el.innerHTML='<div class="err">⚠️ '+e.message+'</div>';
   }
 }
 
@@ -502,8 +695,7 @@ function rankGroup(rows,matches,isFinal,officialOrder={}){
       const oa=Number.isInteger(officialOrder[a.name])?officialOrder[a.name]:Number.MAX_SAFE_INTEGER;
       const ob=Number.isInteger(officialOrder[b.name])?officialOrder[b.name]:Number.MAX_SAFE_INTEGER;
       if(oa!==ob) return oa-ob;
-      // Sin tabla oficial no se inventa un desempate alfabético.
-      return 0;
+      return a.name.localeCompare(b.name,'es');
     });
   });
 }
@@ -535,27 +727,87 @@ function buildGroupSnapshot(matches,standings=[]){
   return {groups,thirds:thirdSelection.ranked,topEight:thirdSelection.selected,thirdSelection,matches,updatedAt:Date.now()};
 }
 async function getGroupSnapshot(force=false){
-  const ttl=15000;
+  const ttl=5000;
   if(!force&&cachedSnapshot&&Date.now()-cachedSnapshot.updatedAt<ttl) return cachedSnapshot;
   if(snapshotPromise) return snapshotPromise;
-  snapshotPromise=Promise.all([
-    apiFetch('competitions/WC/matches'),
-    // La clasificación oficial solo entra como último criterio de desempate;
-    // si falla, los puntos y goles se siguen calculando desde los partidos.
-    apiFetch('competitions/WC/standings').catch(()=>null)
-  ]).then(([matchesData,standingsData])=>{
-    const standings=(standingsData?.standings||[]).filter(s=>s?.type==='TOTAL'&&s?.group);
+  snapshotPromise=(async()=>{
+    const matches=await getTournamentMatches({forceLive:force});
+    // Solo se consulta standings cada 10 minutos (o desde la caché) y únicamente
+    // para aplicar desempates FIFA que no pueden derivarse de los marcadores.
+    const standings=await getOfficialStandings();
     cachedStandings=standings.length?standings:cachedStandings;
-    cachedSnapshot=buildGroupSnapshot(matchesData.matches||[],standings);
+    cachedSnapshot=buildGroupSnapshot(matches,standings);
     buildCtx(cachedSnapshot);
     return cachedSnapshot;
-  }).finally(()=>{snapshotPromise=null;});
+  })().finally(()=>{snapshotPromise=null;});
   return snapshotPromise;
 }
+// ════════ CONTEXTO DEL CHAT ════════
+// El chat recibe más que la tabla: se le envía un resumen del calendario,
+// partidos en vivo, próximos encuentros, posiciones y datos fijos del torneo.
+// Así puede responder preguntas básicas sin depender de conocimiento externo.
+const CHAT_TOURNAMENT_FACTS=`
+DATOS FIJOS DEL TORNEO:
+- FIFA World Cup 2026: 48 selecciones, 12 grupos de cuatro equipos y 104 partidos.
+- Clasifican a la Ronda de 32 los 12 primeros, los 12 segundos y los 8 mejores terceros.
+- La final está programada para el domingo 19 de julio de 2026 en New York/New Jersey Stadium.
+- Colombia integra el Grupo K junto con Portugal, Uzbekistán y R. D. Congo.
+- El calendario de Colombia en la fase de grupos es: Uzbekistán vs Colombia (17 de junio), Colombia vs R. D. Congo (23 de junio) y Colombia vs Portugal (27 de junio de 2026). Los partidos y marcadores del contexto en vivo tienen prioridad sobre esta referencia fija.
+`;
+function chatLocalDate(utcDate){
+  if(!utcDate) return 'fecha por definir';
+  try{return new Date(utcDate).toLocaleString('es-CO',{weekday:'long',day:'numeric',month:'long',year:'numeric',hour:'numeric',minute:'2-digit'});}
+  catch(_){return String(utcDate);}
+}
+function chatMatchStatus(m){
+  const score=matchScore(m);
+  if(m.status==='FINISHED') return `FINAL${score.valid?` ${score.home}-${score.away}`:''}`;
+  if(m.status==='IN_PLAY'||m.status==='PAUSED'||m.status==='SUSPENDED') return `EN VIVO${score.valid?` ${score.home}-${score.away}`:''}${m.minute?` (${m.minute}')`:''}`;
+  return 'PROGRAMADO';
+}
+function chatMatchLine(m){
+  const home=canonicalTeam(m.homeTeam)||esName(m.homeTeam?.name)||m.homeTeam?.shortName||'?';
+  const away=canonicalTeam(m.awayTeam)||esName(m.awayTeam?.name)||m.awayTeam?.shortName||'?';
+  const phase=(m.group||m.stage||m.competition?.name||'Fase por definir').replace?.('GROUP_','Grupo ')||'Fase por definir';
+  return `${chatMatchStatus(m)} | ${home} vs ${away} | ${phase} | ${chatLocalDate(m.utcDate)}`;
+}
+function chatMentionedTeams(question){
+  const q=normTeamName(question);
+  const found=[];
+  Object.values(GROUPS).flat().forEach(team=>{
+    const normalized=normTeamName(team);
+    if(normalized&&q.includes(normalized)) found.push(team);
+  });
+  if(/\bcolombia\b|\bseleccion colombia\b|\btricolor\b/.test(q)&&!found.includes('Colombia')) found.push('Colombia');
+  return [...new Set(found)];
+}
+function buildChatContext(snapshot,question=''){
+  const matches=(snapshot?.matches?.length?snapshot.matches:cachedMatches()).slice();
+  const groups=Object.values(snapshot?.groups||{});
+  const now=new Date();
+  const live=matches.filter(m=>['IN_PLAY','PAUSED','SUSPENDED'].includes(m.status));
+  const today=matches.filter(m=>isToday(m.utcDate)&&!['IN_PLAY','PAUSED','SUSPENDED'].includes(m.status));
+  const upcoming=matches.filter(m=>new Date(m.utcDate)>now&&m.status!=='FINISHED').sort((a,b)=>new Date(a.utcDate)-new Date(b.utcDate));
+  const colombia=matches.filter(m=>canonicalTeam(m.homeTeam)==='Colombia'||canonicalTeam(m.awayTeam)==='Colombia').sort((a,b)=>new Date(a.utcDate)-new Date(b.utcDate));
+  const askedTeams=chatMentionedTeams(question);
+  const relevant=askedTeams.filter(t=>t!=='Colombia').flatMap(team=>matches.filter(m=>canonicalTeam(m.homeTeam)===team||canonicalTeam(m.awayTeam)===team)).sort((a,b)=>new Date(a.utcDate)-new Date(b.utcDate));
+  const tableText=groups.length?groups.map(g=>`Grupo ${g.key} (${groupStateLabel(g)}): ${g.ranked.map((t,i)=>`${i+1}. ${t.name} — ${t.pts} pts, DG ${t.gd}, PJ ${t.pj}`).join(' | ')}`).join('\n'):'Tabla aún no disponible.';
+  const section=(title,list,max=12)=>`${title}:\n${list.length?list.slice(0,max).map(chatMatchLine).join('\n'):'Sin datos en este momento.'}`;
+  const relevantSection=relevant.length?section(`PARTIDOS DE ${askedTeams.filter(t=>t!=='Colombia').join(' Y ').toUpperCase()}`,relevant,8):'';
+  return [
+    CHAT_TOURNAMENT_FACTS.trim(),
+    `FECHA/HORA LOCAL DEL USUARIO: ${now.toLocaleString('es-CO',{weekday:'long',day:'numeric',month:'long',year:'numeric',hour:'numeric',minute:'2-digit'})}.`,
+    'TABLA ACTUAL (los grupos con partido en vivo son provisorios):\n'+tableText,
+    section('PARTIDOS DE COLOMBIA',colombia,6),
+    section('PARTIDOS EN VIVO',live,8),
+    section('PARTIDOS DE HOY',today,16),
+    section('PRÓXIMOS PARTIDOS',upcoming,16),
+    relevantSection,
+    `MEJORES TERCEROS ACTUALES: ${(snapshot?.topEight||[]).map(t=>`3${t.grp} ${t.name}`).join(' | ')||'pendiente de más resultados.'}`
+  ].filter(Boolean).join('\n\n');
+}
 function buildCtx(snapshot){
-  lastCtx=Object.values(snapshot.groups).map(g=>{
-    return `Grupo ${g.key}: `+g.ranked.map((t,i)=>`${i+1}.${sn(t.name)}(${t.pts}pts,DG:${t.gd})`).join(', ');
-  }).join('\n');
+  lastCtx=buildChatContext(snapshot,'');
 }
 function groupStateLabel(g){
   if(g.live) return '● EN VIVO · provisorio';
@@ -578,12 +830,12 @@ function renderStandings(snapshot){
   const thirdInfo=snapshot.thirdSelection?.ambiguous
     ? `Mejores terceros: ${snapshot.thirdSelection.reason} No se resuelve con letras ni orden alfabético.`
     : `Mejores terceros proyectados/confirmados: ${snapshot.topEight.map(t=>'3'+t.grp).join(' · ') || 'pendiente'}.`;
-  el.innerHTML=`<div class="info">Marcadores calculados desde resultados finales y partidos en vivo. Si dos equipos empatan en puntos, diferencia y goles, se conserva el orden oficial FIFA para criterios como fair play. Las posiciones de un grupo con partido activo son provisorias.<br><strong>${thirdInfo}</strong></div><div class="grupos-grid">${cards}</div>`;
+  el.innerHTML=`<div class="info">Marcadores calculados desde resultados finales y partidos en vivo. Si dos equipos empatan en puntos, diferencia y goles, se conserva el orden oficial FIFA para criterios como fair play. Las posiciones de un grupo con partido activo son provisorias.<br><strong>${thirdInfo}</strong><br><small>${cacheStatusText()}</small></div><div class="grupos-grid">${cards}</div>`;
 }
-async function loadStandings(){
+async function loadStandings(force=false){
   const el=document.getElementById('grupos-content');
   el.innerHTML='<div class="spinner">Calculando tabla en vivo...</div>';
-  try{renderStandings(await getGroupSnapshot(true));}
+  try{renderStandings(await getGroupSnapshot(force));}
   catch(e){el.innerHTML='<div class="err">⚠️ '+e.message+'</div>';}
 }
 
@@ -705,11 +957,11 @@ function bracketRow(team,label,confirmed){
   if(confirmed) return `<div class="bt confirmed">${team.flag} ${sn(team.name)}<span class="conf-badge">✓</span></div>`;
   return `<div class="bt projected">${team.flag} ${sn(team.name)}<span class="proj-badge">~</span></div>`;
 }
-async function drawBracket(){
+async function drawBracket(force=false){
   const el=document.getElementById('bracket-content');
   el.innerHTML='<div class="spinner">Calculando llaves con marcadores en vivo...</div>';
   try{
-    const snapshot=await getGroupSnapshot(true);
+    const snapshot=await getGroupSnapshot(force);
     const selectedThirds=snapshot.topEight||[];
     const key=selectedThirds.length===8?selectedThirds.map(t=>t.grp).sort().join(''):null;
     const officialRoutes=key?await loadFifaThirdRouteTable():null;
@@ -731,7 +983,7 @@ async function drawBracket(){
     }).join('');
     const tbd=`<div class="bm"><div class="bt pending">Por definir</div><div class="bt pending">Por definir</div></div>`;
     el.innerHTML=`
-      <div class="info">${routeStatus} Los equipos y puntos se recalculan desde los marcadores finales y en vivo; los empates absolutos respetan los criterios FIFA.</div>
+      <div class="info">${routeStatus} Los equipos y puntos se recalculan desde los marcadores finales y en vivo; los empates absolutos respetan los criterios FIFA.<br><small>${cacheStatusText()}</small></div>
       <div style="font-size:.7rem;margin-bottom:.75rem;display:flex;gap:1rem;flex-wrap:wrap;">
         <span style="color:var(--green)">● Confirmado</span><span style="color:var(--accent)">◉ Proyectado</span><span style="color:var(--muted)">○ Por definir</span>
       </div>
@@ -804,8 +1056,7 @@ function calcTable(g){
     if(b.pts!==a.pts)return b.pts-a.pts;
     const d=(b.gf-b.ga)-(a.gf-a.ga);if(d!==0)return d;
     if(b.gf!==a.gf)return b.gf-a.gf;
-    // El simulador no dispone de tarjetas/fair play: no desempata por nombre.
-    return 0;
+    return a.name.localeCompare(b.name);
   });
 }
 function resetSim(){
@@ -818,9 +1069,9 @@ function resetSim(){
 async function simFromAPI(){
   document.getElementById('sim-mode-badge').textContent='⌛ Cargando...';
   try{
-    const d=await apiFetch('competitions/WC/matches');
+    const matches=await getTournamentMatches({forceLive:true,refreshFinished:true});
     simScores={};
-    (d.matches||[]).filter(isGroupMatch).forEach(m=>{
+    (matches||[]).filter(isGroupMatch).forEach(m=>{
       if(!COUNTED_GROUP_STATUSES.has(m.status)) return;
       const g=String(m.group||'').replace('GROUP_','');
       const home=canonicalTeam(m.homeTeam),away=canonicalTeam(m.awayTeam),score=matchScore(m);
@@ -856,14 +1107,24 @@ function addMsg(txt,role){
   else d.textContent=txt;
   el.appendChild(d);el.scrollTop=el.scrollHeight;return d;
 }
+async function chatContextFor(question){
+  try{
+    const snapshot=await getGroupSnapshot(false);
+    return buildChatContext(snapshot,question);
+  }catch(_){
+    // Incluso sin red, el contexto conserva el calendario fijo y la caché local.
+    return buildChatContext(cachedSnapshot||{matches:cachedMatches(),groups:{}},question);
+  }
+}
 async function sendChat(){
   const inp=document.getElementById('chat-in');
   const txt=inp.value.trim();if(!txt)return;
   inp.value='';addMsg(txt,'user');chatHistory.push({role:'user',content:txt});
   const t=addMsg('Analizando...','ai');
   try{
+    const context=await chatContextFor(txt);
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({messages:chatHistory,context:lastCtx||'Tabla no cargada aún.'})});
+      body:JSON.stringify({messages:chatHistory,context:context||lastCtx||CHAT_TOURNAMENT_FACTS})});
     const d=await r.json();t.remove();
     if(d.error)throw new Error(d.error);
     addMsg(d.reply,'ai');chatHistory.push({role:'assistant',content:d.reply});
@@ -873,16 +1134,18 @@ async function sendChat(){
 
 // ════════ INIT ════════
 loadMatches();
-// Precarga desde el feed de partidos: una sola fuente para En Vivo, Grupos y Llaves.
+// La primera visita descarga el calendario completo una vez. Después, las
+// actualizaciones periódicas solo consultan partidos IN_PLAY/PAUSED y reutilizan
+// resultados finalizados persistidos en el navegador.
 getGroupSnapshot().catch(()=>{});
 loadFifaThirdRouteTable().catch(()=>{});
 
 setInterval(()=>{
   const active=document.querySelector('.section.active')?.id;
-  if(active==='partidos') loadMatches();
-  else if(active==='grupos') loadStandings();
-  else if(active==='bracket') drawBracket();
-},30000);
+  if(active==='partidos') loadMatches(false);
+  else if(active==='grupos') loadStandings(false);
+  else if(active==='bracket') drawBracket(false);
+},LIVE_POLL_MS);
 </script>
 </body>
 </html>
